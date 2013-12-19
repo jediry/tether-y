@@ -1,4 +1,3 @@
-Load/save configuration to a separate file
 Detect dropped proxy and loss of internet connectivity
 Pretty print
 Collect configuration from the user on first-run

@@ -1,12 +1,7 @@
 # equires -RunAsAdministrator
 
-Param([Switch] $WhatIf=$False)
-
-
-$SSID = "Tether-X-$($Env:COMPUTERNAME)"
-$Password = "12345678"
-$ProxyMAC = "4C:25:78:52:5B:B4"
-$ProxyPort = "8080"
+Param([Switch] $WhatIf=$False,
+      [String] $ConfigFile="$($Env:USERPROFILE)\.tether-y.xml")
 
 
 Function Write-WaitSpinner($Block, $Interval,
@@ -46,6 +41,64 @@ Function Write-WaitSpinner($Block, $Interval,
 
         # Sleep for the prescribed amount of time
         Start-Sleep -Milliseconds $Interval
+    }
+}
+
+
+Function Read-Config([String] $Path) {
+
+    $Config = @{
+        "ProxyMAC"      = $Null;
+        "ProxyPort"     = 8080;
+        "NetworkID"     = "TETHER-X-$($Env:COMPUTERNAME)";
+        "NetworkKey"    = "1234567890";
+    }
+
+    Write-Host -NoNewline "Reading configuration file "
+    Write-Host -NoNewline -ForegroundColor Yellow $Path
+    Write-Host -NoNewline "..."
+
+    If (Test-Path -PathType "Leaf" -Path $Path) {
+        Try {
+            [XML] $xml = Get-Content $Path
+            $Config.ProxyMAC = $xml."tether-y-config"."proxy-mac"
+            $Config.ProxyPort = $xml."tether-y-config"."proxy-port"
+            $Config.NetworkID = $xml."tether-y-config"."network-id"
+            $Config.NetworkKey = $xml."tether-y-config"."network-key"
+            Write-Host -ForegroundColor Green "[SUCCESS]"
+        } Catch {
+            Write-Host -ForegroundColor Red "[FAILURE]"
+        }
+    } Else {
+        Write-Host -ForegroundColor Cyan "[NOT PRESENT]"
+    }
+
+    Return $Config
+}
+
+
+Function Write-Config($Config,
+                      [String] $Path,
+                      [Switch] $WhatIf=$False) {
+    Write-Host -NoNewline "Writing config file "
+    Write-Host -NoNewline -ForegroundColor Yellow $Path
+    Write-Host -NoNewline "..."
+
+    If (!$WhatIf) {
+        Try {
+            $XML = New-Object -TypeName "System.Xml.XmlDocument"
+            $Root = $XML.AppendChild($XML.CreateElement("tether-y-config"))
+            $Root.AppendChild($XML.CreateElement("proxy-mac")).AppendChild($XML.CreateTextNode($Config.ProxyMAC)) > $Null
+            $Root.AppendChild($XML.CreateElement("proxy-port")).AppendChild($XML.CreateTextNode($Config.ProxyPort)) > $Null
+            $Root.AppendChild($XML.CreateElement("network-id")).AppendChild($XML.CreateTextNode($Config.NetworkID)) > $Null
+            $Root.AppendChild($XML.CreateElement("network-key")).AppendChild($XML.CreateTextNode($Config.NetworkKey)) > $Null
+            $XML.Save($Path)
+            Write-Host -ForegroundColor Green "[SUCCESS]"
+        } Catch {
+            Write-Host -ForegroundColor Red "[FAILURE]"
+        }
+    } Else {
+        Write-Host -ForegroundColor Cyan "[SKIPPED]"
     }
 }
 
@@ -296,21 +349,22 @@ If (!$WhatIf) {
 
 
 Try {
+    $Config = Read-Config $ConfigFile
 
     # Check the status of the hosted wireless network, and start if it's not running
-    $Adapter = Start-HostedNetwork -SSID $SSID -Key $Password -WhatIf:$WhatIf
+    $Adapter = Start-HostedNetwork -SSID $Config.NetworkID -Key $Config.NetworkKey -WhatIf:$WhatIf
 
     # Wait for the proxy to connect to the hosted network (based on the MAC address configured above)
-    $ProxyIP = Wait-Proxy $ProxyMAC -Interval 150 -WhatIf:$WhatIf
+    $ProxyIP = Wait-Proxy $Config.ProxyMAC -Interval 150 -WhatIf:$WhatIf
 
     # Set this as our proxy server
-    Set-Proxy -IPAddress $ProxyIP -Port $ProxyPort -WhatIf:$WhatIf
+    Set-Proxy -IPAddress $ProxyIP -Port $Config.ProxyPort -WhatIf:$WhatIf
 
     # Verify that the Internet is reachable
     Wait-Internet -Interval 1000 -WhatIf:$WhatIf
 
     # Wait for the proxy to disappear, or for the user to tell us to disconnect
-    Wait-Disconnect -Interval 5000 $ProxyMAC -WhatIf:$WhatIf
+    Wait-Disconnect -Interval 5000 $Config.ProxyMAC -WhatIf:$WhatIf
 
 } Catch [System.Management.Automation.RuntimeException] {
 
@@ -324,6 +378,9 @@ Try {
 
     # Shut down the hosted network
     Stop-HostedNetwork -WhatIf:$WhatIf
+
+    # Write the current config to the config file
+    Write-Config -Path $ConfigFile -Config $Config -WhatIf:$WhatIf
 
     If (!$WhatIf) {
         # Put Ctrl-C handling back the way we found it
