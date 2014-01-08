@@ -1,6 +1,6 @@
+Figure out how to kick the PC Settings app to notice changed proxy
 Detect dropped proxy and loss of internet connectivity
 Pretty print
-Collect configuration from the user on first-run
 Require admin privileges, unless in what-if mode
 Track/print client connect/disconnect
 Figure out how to kick the browser and MSTSC so that they recognize the proxy faster...shell setting?
