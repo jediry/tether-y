@@ -4,4 +4,4 @@ Pretty print
 Require admin privileges, unless in what-if mode
 Track/print client connect/disconnect
 Figure out how to kick the browser and MSTSC so that they recognize the proxy faster...shell setting?
-Support pluggable proxy rewriters.
+Make the proxy engine exclude addresses for local networks

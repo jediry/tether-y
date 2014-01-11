@@ -80,6 +80,7 @@ Function Write-WaitSpinner($Block,
         $Iteration++
     }
 
+    Write-Host -NoNewline "`b"
     Return $Null
 }
 
@@ -89,6 +90,7 @@ Function Read-Config([String] $Path) {
     $Config = @{
         "ProxyMAC"      = $Null;
         "ProxyPort"     = 8080;
+        "ProxyEngine"   = $Null;
         "NetworkSSID"   = "TETHER-X-$($Env:COMPUTERNAME)";
         "NetworkKey"    = "1234567890";
         "Loaded"        = $False;
@@ -114,6 +116,13 @@ Function Read-Config([String] $Path) {
             $ProxyPort = $xml."tether-y-config"."proxy-port"
             If (![string]::IsNullOrEmpty($ProxyPort)) {
                 $Config.ProxyPort = $ProxyPort
+            } Else {
+                $Incomplete = $True
+            }
+
+            $ProxyEngine = $xml."tether-y-config"."proxy-engine"
+            If (![string]::IsNullOrEmpty($ProxyEngine)) {
+                $Config.ProxyEngine = $ProxyEngine
             } Else {
                 $Incomplete = $True
             }
@@ -158,13 +167,18 @@ Function Write-Config($Config,
 
     If (!$WhatIf) {
         Try {
-            $XML = New-Object -TypeName "System.Xml.XmlDocument"
-            $Root = $XML.AppendChild($XML.CreateElement("tether-y-config"))
-            $Root.AppendChild($XML.CreateElement("proxy-mac")).AppendChild($XML.CreateTextNode($Config.ProxyMAC)) > $Null
-            $Root.AppendChild($XML.CreateElement("proxy-port")).AppendChild($XML.CreateTextNode($Config.ProxyPort)) > $Null
-            $Root.AppendChild($XML.CreateElement("network-ssid")).AppendChild($XML.CreateTextNode($Config.NetworkSSID)) > $Null
-            $Root.AppendChild($XML.CreateElement("network-key")).AppendChild($XML.CreateTextNode($Config.NetworkKey)) > $Null
-            $XML.Save($Path)
+            $XML = @"
+                <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+                <tether-y-config>
+                  <network-ssid>$($Config.NetworkSSID)</network-ssid>
+                  <network-key>$($Config.NetworkKey)</network-key>
+                  <proxy-mac>$($Config.ProxyMAC)</proxy-mac>
+                  <proxy-port>$($Config.ProxyPort)</proxy-port>
+                  <proxy-engine>$($Config.ProxyEngine)</proxy-engine>
+                </tether-y-config>
+"@
+            $XML = $XML -Replace "(?m)^                ",""
+            Set-Content -Path $Path -Value $XML
             Write-Host -ForegroundColor Green "[SUCCESS]"
         } Catch {
             Write-Host -ForegroundColor Red "[FAILURE]"
@@ -232,8 +246,14 @@ Function Get-ProxyIP($Config,
         Do {
             # Check (again) to see if there are any new devices
             Get-NetNeighbor -InterfaceIndex $Adapter.ifIndex -AddressFamily IPv4 | ForEach-Object {
-                $Found = $False
-                If ($_.LinkLayerAddress -ne "ffffffffffff" -and $_.LinkLayerAddress -ne "000000000000") {
+                # Skip over some MAC addresses that couldn't possibly be the Tether-X device
+                If ($_.LinkLayerAddress -eq "ffffffffffff" -or $_.LinkLayerAddress -eq "000000000000") {
+                    # Ignore
+                } ElseIf ($_.State -eq "Permanent") {
+                    # Ignore
+                } Else {
+                    # OK, this looks like a possibility. Only add it to our list of options if it's not already in there
+                    $Found = $False
                     ForEach ($N in $Neighbors) {
                         If ($N.LinkLayerAddress -eq $_.LinkLayerAddress) {
                             $Found = $True
@@ -305,6 +325,56 @@ Function Get-ProxyPort($Config) {
 }
 
 
+Function Get-ProxyEngine($Config) {
+    If (!$Config.Loaded -or [String]::IsNullOrEmpty($Config.ProxyEngine)) {
+        $Engines = @( )
+        $DefaultIndex = -1
+        Get-Item -Path ProxyEngines\*.ps1 | ForEach-Object {
+            $Description = . $_ -Action "describe"
+            $Available = . $_ -Action "detect"
+            $Name = ($_ -Replace '\.ps1','') -Replace '^.*\\',''
+            If ($Name -eq $Config.ProxyEngine) {
+                If ($Available) {
+                    Write-Host -NoNewline -ForegroundColor Green "`t[$($Engines.Count)] "
+                    $DefaultIndex = $Engines.Count
+                } Else {
+                    # Hmmm...default engine is now unavailable?
+                    Write-Host -NoNewline "`t[$($Engines.Count)] "
+                    $Config.ProxyEngine = $Null
+                }
+            } Else {
+                Write-Host -NoNewline "`t[$($Engines.Count)] "
+            }
+
+            If ($Available) {
+                Write-Host -ForegroundColor White $Description
+            } Else {
+                Write-Host -ForegroundColor DarkGray $Description
+            }
+            $Engines += @{ "Name" = $Name; "Description" = $Description; "Available" = $Available; }
+        }
+
+        Do {
+            $Index = Get-UserValue "Select which proxy engine you wish to use for routing traffic through Tether-X" -DefaultValue $DefaultIndex
+            If ( $Index -ne $Null) {
+                $Index = [int] $Index
+                If ($Index -ge 0 -and $Index -lt $Engines.Count) {
+                    $Engine = $Engines[ $Index ]
+                    If ($Engine.Available) {
+                        $Config.ProxyEngine = $Engines[ $Index ].Name
+                    } Else {
+                        # TODO: provide URL to acquire
+                        Write-Host "This proxy engine is not currently installed on your system."
+                    }
+                }
+            }
+        } While ([String]::IsNullOrEmpty($Config.ProxyEngine))
+    }
+
+    Return $Config.ProxyEngine
+}
+
+
 Function Start-HostedNetwork($SSID, $Key,
                              [Switch] $WhatIf=$False) {
     Write-Host -NoNewline -ForegroundColor Cyan "Enabling "
@@ -370,84 +440,26 @@ Function Stop-HostedNetwork([Switch] $WhatIf=$False) {
 }
 
 
-$Script:ProxyRegKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+Function Start-Proxy([string] $IPAddress,
+                     [string] $Port,
+                     [string] $Engine,
+                     [Switch] $WhatIf=$False) {
 
-Function Set-Proxy($IPAddress, $Port, [Switch] $WhatIf=$False) {
-
-    $ProxyString = "$IPAddress`:$Port"
     Write-Host -NoNewline "Setting proxy server address "
     Write-Host -NoNewline -ForegroundColor Yellow $ProxyString
     Write-Host -NoNewline "..."
 
-    If (!$WhatIf) {
-        $CurrentProxyString = (Get-ItemProperty -Path $Script:ProxyRegKey ProxyServer -ErrorAction:SilentlyContinue).ProxyServer
-        If ($CurrentProxyString -ne $ProxyString) {
-            Set-ItemProperty -Path $Script:ProxyRegKey ProxyServer $ProxyString -ErrorAction:SilentlyContinue
-            If ($?) {
-                Write-Host -ForegroundColor Green "[SUCCESS]"
-            } Else {
-                Write-Host -ForegroundColor Red "[FAILURE]"
-                Throw "Failed to set proxy address"
-            }
-        } Else {
-            Write-Host -ForegroundColor Yellow "[NO CHANGE]"
-        }
-    } Else {
-        Write-Host -ForegroundColor Cyan "[SKIPPED]"
-    }
+    # Addresses to exclude from proxying
+    $Excludes = @( "localhost", "127.0.0.1", "$Env:ComputerName" )
 
-    Write-Host -NoNewline "Enabling proxy..."
-    If (!$WhatIf) {
-        $CurrentProxyEnable = (Get-ItemProperty -Path $Script:ProxyRegKey ProxyEnable -ErrorAction:SilentlyContinue).ProxyEnable
-        If ($CurrentProxyEnable -ne 1) {
-            Set-ItemProperty -Path $Script:ProxyRegKey ProxyEnable 1 -ErrorAction:SilentlyContinue
-            If ($?) {
-                Write-Host -ForegroundColor Green "[SUCCESS]"
-            } Else {
-                Write-Host -ForegroundColor Red "[FAILURE]"
-                Throw "Failed to enable proxy"
-            }
-        } Else {
-            Write-Host -ForegroundColor Yellow "[NO CHANGE]"
-        }
-    } Else {
-        Write-Host -ForegroundColor Cyan "[SKIPPED]"
-    }
-
-    [System.Net.WebRequest]::DefaultWebProxy = [System.Net.WebProxy]$ProxyString
+    . ProxyEngines\$Engine.ps1 -Action "start" -ProxyIP $IPAddress -ProxyPort $Port -ExcludeAddresses $Excludes -WhatIf:$WhatIf
 }
 
 
-Function Clear-Proxy([Switch] $WhatIf=$False) {
+Function Stop-Proxy([string] $Engine,
+                    [switch] $WhatIf=$False) {
     Write-Host -NoNewline "Disabling proxy..."
-    $CurrentProxyEnable = (Get-ItemProperty -Path $Script:ProxyRegKey ProxyEnable -ErrorAction:SilentlyContinue).ProxyEnable
-    If ($CurrentProxyEnable -ne 0) {
-        Set-ItemProperty -Path $Script:ProxyRegKey ProxyEnable 0 -ErrorAction:SilentlyContinue
-        If ($?) {
-            Write-Host -ForegroundColor Green "[SUCCESS]"
-        } Else {
-            Write-Host -ForegroundColor Red "[FAILURE]"
-            Throw "Failed to disable proxy"
-        }
-    } Else {
-        Write-Host -ForegroundColor Yellow "[NO CHANGE]"
-    }
-
-    Write-Host -NoNewline "Clearing proxy server address..."
-    $CurrentProxyString = (Get-ItemProperty -Path $Script:ProxyRegKey ProxyServer -ErrorAction:SilentlyContinue).ProxyServer
-    If (![String]::IsNullOrEmpty($CurrentProxyString)) {
-        Clear-ItemProperty -Path $Script:ProxyRegKey ProxyServer -ErrorAction:SilentlyContinue
-        If ($?) {
-            Write-Host -ForegroundColor Green "[SUCCESS]"
-        } Else {
-            Write-Host -ForegroundColor Red "[FAILURE]"
-            Throw "Failed to clear proxy address"
-        }
-    } Else {
-        Write-Host -ForegroundColor Yellow "[NO CHANGE]"
-    }
-
-    [System.Net.WebRequest]::DefaultWebProxy = $Null
+    . ProxyEngines\$Engine.ps1 -Action "stop" -WhatIf:$WhatIf
 }
 
 
@@ -554,7 +566,7 @@ If (!$WhatIf) {
 # Load any existing configuration file (or defaults if the file is not present) 
 $Config = Read-Config $ConfigFile
 
-
+$ProxyEngine = $Null
 $RetrySetup = $True
 While ($RetrySetup) {
     Try {
@@ -577,13 +589,16 @@ While ($RetrySetup) {
         # Check the status of the hosted wireless network, and start if it's not running
         $Adapter = Start-HostedNetwork -SSID $NetworkSSID -Key $NetworkKey -WhatIf:$WhatIf
 
+        # Decide which proxy engine we're using
+        $ProxyEngine = Get-ProxyEngine -Config $Config
+
         # Wait for the proxy to connect to the hosted network (based on the MAC address configured above)
         $ProxyIP = Get-ProxyIP -Config $Config -Adapter $Adapter -WhatIf:$WhatIf
 
         $ProxyPort = Get-ProxyPort -Config $Config
 
         # Set this as our proxy server
-        Set-Proxy -IPAddress $ProxyIP -Port $ProxyPort -WhatIf:$WhatIf
+        Start-Proxy -IPAddress $ProxyIP -Port $ProxyPort -Engine $ProxyEngine -WhatIf:$WhatIf
 
         # Verify that the Internet is reachable
         Wait-Internet -Interval 1000 -WhatIf:$WhatIf
@@ -608,7 +623,10 @@ While ($RetrySetup) {
     } Finally {
 
         # Clear the proxy if we set it
-        Clear-Proxy -WhatIf:$WhatIf
+        If ($ProxyEngine -ne $Null) {
+            Stop-Proxy -Engine $ProxyEngine -WhatIf:$WhatIf
+            $ProxyEngine = $Null
+        }
 
         # Shut down the hosted network
         Stop-HostedNetwork -WhatIf:$WhatIf
